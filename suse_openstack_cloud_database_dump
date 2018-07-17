@@ -1,0 +1,234 @@
+#!/bin/bash
+##########################################################################
+# Name:        Supportconfig Plugin for SUSE OpenStack Cloud Database Dump
+# Description: Dumps the OpenStack database to a text file.  
+# License:     GPLv2
+# Modified:    2018 July 17 
+##########################################################################
+
+DATABASES_TO_DUMP='cinder glance keystone neutron nova'
+PG_DUMP='/usr/bin/pg_dump'
+MYSQL_DUMP='/usr/bin/mysqldump'
+SOC_RELEASE='/etc/products.d/suse-openstack-cloud*prod'
+SUPPORTCONFIG_CONF='/etc/supportconfig.conf'
+
+##########################################################################
+
+_database_get_server() {
+  if is_crowbar; then
+    # on soc7 with HA - db runs under pacemaker
+    if _is_db_ha && is_soc7; then
+      db_cluster_member=$(knife role show database-config-default \
+	      | grep 'elements_expanded' -A3 | grep 'database-server' -A1 \
+	      | tail -1)
+      ssh -q -o "StrictHostKeyChecking no" $db_cluster_member \
+	      "crm resource locate $SQL_ENGINE" \
+	      | cut -f2 -d\:
+    else 
+      knife role show database-config-default \
+        | grep "database-server" | grep -v "element_order" | grep "\[" \
+        | cut -f2 -d\" | cut -f1 -d\"
+    fi
+  elif is_soc8; then
+    echo localhost
+  fi
+}
+
+##########################################################################
+
+_mysql_get_root_username() {
+  echo root
+}
+
+_mysql_get_root_password() {
+  if is_crowbar; then
+    knife role show database-config-default \
+      | grep server_root_password | head -1 \
+      | cut -f2 -d\: | sed -e 's/\ //g'
+  fi
+}
+
+_is_db_ha() {
+  [ $(knife role show database-config-default | grep cluster | wc -l) -gt 0 ]
+  return $?
+}
+
+_mysql_create_option_file(){
+  local option_file='/root/mysqldump.cnf'
+
+  # creating options file currently only supported 
+  # with crowbar releases
+  if is_crowbar; then
+    mysql_database_server=$(_database_get_server)
+    mysql_root_password=$(_mysql_get_root_password)
+    mysql_root_username=$(_mysql_get_root_username)
+  
+    touch "$option_file"
+    chmod 600 "$option_file"
+
+    cat >$option_file <<EOL
+[mysqldump]
+user=$mysql_root_username
+password=$mysql_root_password
+EOL
+
+    scp -q -o "StrictHostKeyChecking no" "$option_file" \
+      root@"$mysql_database_server":"$option_file"
+  
+  # with soc8 ansible deploys my.cnf file to root folder
+  elif is_soc8; then
+    option_file='/root/.my.cnf'
+  fi
+
+  # prints file path to stdout
+  echo "$option_file"
+}
+
+_mysql_remove_option_file(){
+  local option_file="$1"
+  local database_server="$2"
+  
+  # removes options file only if it had been created by this script
+  if is_crowbar; then
+    rm -rf "$option_file"
+    ssh -q "$database_server" -o "StrictHostKeyChecking no" \
+      "rm -rf $option_file"
+  fi
+}
+
+##########################################################################
+
+# for crowbar releases only works from admin node 
+# as knife is being used to get mysql root password
+mysql_dump_databases() {
+  DATABASES_TO_DUMP="mysql $DATABASES_TO_DUMP"
+  
+  mysqldump_option_file=$(_mysql_create_option_file)
+
+  # runs locally on ardana 
+  if is_soc8 && is_soc8_dbnode; then
+    $MYSQL_DUMP --defaults-file=$mysqldump_option_file \
+      --databases $DATABASES_TO_DUMP 2>/dev/null
+  else
+    mysql_database_server=$(_database_get_server)
+  
+    # dump databases to stdout  
+    ssh -q "$mysql_database_server" -o "StrictHostKeyChecking no" \
+        "$MYSQL_DUMP --defaults-file=$mysqldump_option_file \
+          --databases $DATABASES_TO_DUMP 2>/dev/null"
+  
+    _mysql_remove_option_file "$mysqldump_option_file" "$mysql_database_server"
+  fi
+}
+
+
+# postgre dump for SOC7 and SOC8-CB
+# runs on admin node for consistency 
+postgre_dump_databases() {
+  DATABASES_TO_DUMP="postgres $DATABASES_TO_DUMP"
+  database_server=$(_database_get_server)
+
+  # dump databases to stdout  
+  for database in $DATABASES_TO_DUMP; do
+    ssh -q $database_server -o "StrictHostKeyChecking no" \
+      "su postgres -c \"cd ~; $PG_DUMP $database\" 2>/dev/null" 
+  done
+}
+
+##########################################################################
+
+get_sql_engine() {
+  if is_crowbar; then
+    knife role show database-config-default \
+      | grep sql_engine | cut -f2 -d\: | sed -e 's/\ //g'
+  else 
+    echo mysql
+  fi
+}
+
+# returns SOC version number i
+# or -1 if no cloud deployed
+get_soc_version() {
+  if [ -e $SOC_RELEASE ]; then
+    grep '/version' $SOC_RELEASE | cut -f2 -d\> | cut -f1 -d\< 
+  else
+    echo '-1'
+  fi
+}
+
+is_soc7() {
+  [ $(get_soc_version) -eq 7 ]
+  return $? 
+}
+
+is_soc8() {
+  [ $(get_soc_version) -eq 8 ]
+  return $? 
+}
+
+is_soc8_dbnode() {
+  #rpm -q "mariadb" >/dev/null 2>&1
+  systemctl status mariadb >/dev/null 2>&1
+  return $?
+}
+
+is_soc8_crowbar() {
+  is_soc8 && [ $(ls -1 $SOC_RELEASE | grep crowbar | wc -l) -eq 1 ]
+  return $?  
+}
+
+is_crowbar() {
+  is_soc7 || is_soc8_crowbar
+  return $?
+}
+
+is_crowbar_admin() {
+  rpm -q "crowbar-openstack" >/dev/null 2>&1
+  return $?
+}
+
+# SUSE-OPENSTACK-PLUGIN-DUMP-DATABASES="keystone nova"
+get_databases_from_supportconfig_conf() {
+  grep 'SUSE-OPENSTACK-PLUGIN-DUMP-DATABASES' $SUPPORTCONFIG_CONF 2>/dev/null \
+    | grep -v '#' | cut -f2 -d\" 
+}
+
+##########################################################################
+
+main() {
+  # only supported for SOC7+
+  if [ $(get_soc_version) -lt 7 ] ; then
+    echo "ERROR: database dump only supported for SOC releases version 7 and above. "
+    exit 1
+  fi
+  
+  # runs only on admin if deployed with crowbar
+  if is_crowbar && ! is_crowbar_admin; then
+    echo "ERROR: Database dump only supported from admin node." 
+    exit 1
+  fi
+  # runs locally on soc8
+  if is_soc8 && ! is_soc8_dbnode && ! is_crowbar; then
+    echo "ERROR: mariaDB not running on this node." 
+    exit 1
+  fi
+
+  databases_from_supportconfig_conf=$(get_databases_from_supportconfig_conf)
+  if [ ${#databases_from_supportconfig_conf} -gt 0 ]; then
+    DATABASES_TO_DUMP=$databases_from_supportconfig_conf 
+  fi
+  
+  SQL_ENGINE=$(get_sql_engine)
+  if [ "$SQL_ENGINE" == "mysql" ]; then
+    mysql_dump_databases
+  elif [ "$SQL_ENGINE" == "postgresql" ]; then
+    postgre_dump_databases
+  else 
+    echo "ERROR: unknown database type." 
+    exit 1
+  fi
+  
+  exit 0
+}
+
+main
